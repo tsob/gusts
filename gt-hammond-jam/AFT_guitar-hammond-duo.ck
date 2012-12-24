@@ -1,0 +1,153 @@
+// @title AFT_guitar-hammond-duo.ck
+// @author Tim O'Brien (tsob@ccrma), adapted from code by
+//         Chris Chafe (cc@ccrma) and Hongchan Choi (hongchan@ccrma)
+// @desc Free jam with guitar input (direct and line in from amp) controlling B3 ugen
+// @note amplitude/frequency tracking using UAna ugens
+// @version chuck-1.3.1.3 / ma-0.2.2c
+// @revision 1
+
+// NOTE: This is meant for direct guitar input on left channel
+///////  and amp line in on right channel.
+
+// IMPORTANT NOTE:
+// If you're using speakers and your microphone at the same time,
+// you might experience serious feedback. Make sure to use 
+// the headphone or earbuds to avoid it.
+
+// pipe input into analysis audio graph:
+// track amplitude for gain of FM patch
+// frequency will be max bin amplitude from the spectrum
+adc.left => FFT fft  =^ RMS rms => blackhole;
+
+// Output to two mono files...
+string filename[2];
+"gt-hammond-jam-1.wav" => filename[0];
+"gt-hammond-jam-2.wav" => filename[1];
+
+// setup FFT: choose high-quality transform parameters
+4096 => fft.size;
+Windowing.hann(fft.size() / 2) => fft.window;
+20 => int overlap;
+0 => int ctr;
+second / samp => float srate;
+
+WvOut w[2]; // 2 output files
+dac.left => w[0] => blackhole;
+dac.right => w[1] => blackhole;
+filename[0] => w[0].wavFilename; //guitar
+filename[1] => w[1].wavFilename; //hammond
+
+// actual audio graph and parameter setting
+// NOTE: gain 'g' prevents direct connection bug
+adc.right => Gain g => dac.left;
+1.0 => g.gain;
+
+// creating hammond organ-like FM instrument
+BeeThree b3 => dac.right; 
+// set initial frequency
+60 => Std.mtof => b3.freq; 
+// instantiate a smoother to smooth tracker results (see below)
+Smooth sma, smf;
+// set time constant: shorter time constant gives faster 
+// response but more jittery values
+sma.setTimeConstant((fft.size() / 2)::samp);
+smf.setTimeConstant((fft.size() / 5)::samp);
+
+
+// setGainAndFreq()
+spork ~ setGainAndFreq();
+fun void setGainAndFreq() {
+    while (true) {
+        // apply smoothed values
+        b3.gain(sma.getLast()); 
+        b3.freq(smf.getLast());
+        1::samp => now;
+    }   
+}
+
+
+// main inf-loop
+while(true) {
+    // hop in time by overlap amount
+    (fft.size() / overlap)::samp => now; 
+    // then we've gotten our first bufferful
+    if (ctr > overlap) {
+        // compute the FFT and RMS analyses
+        rms.upchuck(); 
+        rms.fval(0) => float a;
+        Math.rmstodb(a) => float db;
+        // boost the sensitity
+        30 + db * 15 => db;
+        // but clip at maximum
+        Math.min(100, db) => db; 
+        sma.setNext(Math.dbtorms(db));      
+        
+        0 => float max;
+        0 => int where;
+        // look for a frequency peak in the spectrum
+        // half of spectrum to save work
+        for(0 => int i; i < fft.size()/4; ++i) {
+            if(fft.fval(i) > max) {
+                fft.fval(i) => max;
+                i => where;
+            }
+        }
+        // get frequency of peak
+        (where $ float) / fft.size() * srate => float f; 
+        // then convert it to MIDI pitch
+        f => Math.ftom => float p;
+        // plus a major third
+        4 +=> p; 
+        // set lower boundary: prevents note too low
+        Math.max(20, p) => p;
+        // new freq if not noise
+        if(db > 10.0) {
+            smf.setNext(Math.mtof(p));
+        }
+    }
+    ctr++;
+}
+
+
+// @class Smooth
+// @desc contral signal generator for smooth transition
+class Smooth
+{
+    // audio graph
+    Step in => Gain out => blackhole;
+    Gain fb => out;
+    out => fb;
+    
+    // init: smoothing coefficient, default no smoothing
+    0.0 => float coef;
+    initGains();
+    
+    // initGains()
+    fun void initGains() {
+        in.gain(1.0 - coef);
+        fb.gain(coef);
+    }
+    
+    // setNext(): set target value
+    fun void setNext(float value) { 
+        in.next(value); 
+    }
+    
+    // getLast(): return current interpolated value
+    fun float getLast() {
+        1::samp => now; 
+        return out.last(); 
+    }
+    
+    // setExpo(): set smoothing directly from exponent
+    fun void setExpo(float value) { 
+        value => coef;
+        initGains();
+    }
+    
+    // setTimeConstant(): set smoothing duration
+    fun void setTimeConstant(dur duration) {
+        Math.exp(-1.0 / (duration / samp)) => coef;
+        initGains();
+    }
+} // END OF CLASS: Smooth
